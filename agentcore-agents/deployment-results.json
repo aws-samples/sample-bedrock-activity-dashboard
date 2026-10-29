@@ -1,0 +1,6 @@
+{
+  "guardrail-recommender": "guardrailrecommender_guardrailrecommender-qUPSxyGAsy",
+  "weekly-digest-orchestrator": "weeklydigestorch_weeklydigestorch-E47C7wCD8P",
+  "_note": "11 deterministic (⚙️) agents previously listed here were deployed as AgentCore Runtimes but never actually invoked (AgentExecutionService._try_direct_execution always short-circuited before reaching AgentCoreInvoker). Their Runtimes and owning CloudFormation stacks (AgentCore-<name>-default) were deleted from AWS, and their source packages removed from this directory. Only the 2 genuinely agentic Runtimes remain here.",
+  "_deployed_at": "2026-08-07T00:00:00Z"
+}

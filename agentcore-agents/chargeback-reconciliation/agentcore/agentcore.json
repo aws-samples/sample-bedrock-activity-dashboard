@@ -1,0 +1,9 @@
+{
+  "name": "chargeback-reconciliation",
+  "description": "Chargeback Reconciliation Agent - compares AWS billing against usage estimates with proportional allocation",
+  "framework": "strands",
+  "entrypoint": "entrypoint.py",
+  "runtime": {
+    "python_version": "3.13"
+  }
+}

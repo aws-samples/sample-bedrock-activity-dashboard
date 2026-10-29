@@ -1,0 +1,446 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bedrock Activity Dashboard - Data Stack
+  VPC, RDS PostgreSQL, Secrets Manager, ECR Repository, S3 Invocation Logs Bucket
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t3.medium]
+  DbSecretKmsKeyId:
+    Type: String
+    Default: ''
+    Description: >
+      Optional customer-managed KMS key ID or ARN for the DbSecret. When
+      set, DbSecret is encrypted with the operator's CMK. Leaving this
+      empty falls back to the AWS-managed alias/aws/secretsmanager key —
+      intentional sample default so the template deploys without a
+      prerequisite CMK. See the README's
+      Hardening section for CMK rotation guidance.
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  HasDbSecretCmk: !Not [!Equals [!Ref DbSecretKmsKeyId, '']]
+
+Resources:
+  # ---- VPC ----
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub bedrock-dashboard-${Environment}-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub bedrock-dashboard-${Environment}-public-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub bedrock-dashboard-${Environment}-public-2
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub bedrock-dashboard-${Environment}-private-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub bedrock-dashboard-${Environment}-private-2
+
+  IsolatedSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.5.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub bedrock-dashboard-${Environment}-isolated-1
+
+  IsolatedSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.6.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub bedrock-dashboard-${Environment}-isolated-2
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---- Database ----
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS PostgreSQL
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 10.0.0.0/16
+          Description: Allow VPC traffic to PostgreSQL
+
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    # The template accepts a customer-managed KMS key via
+    # DbSecretKmsKeyId; when empty, the sample defaults to the
+    # AWS-managed alias/aws/secretsmanager key so it deploys without a
+    # prerequisite CMK.
+    Properties:
+      Name: !Sub bedrock-dashboard/${Environment}/db-credentials
+      # CMK when supplied, AWS-managed alias otherwise.
+      KmsKeyId: !If
+        - HasDbSecretCmk
+        - !Ref DbSecretKmsKeyId
+        - alias/aws/secretsmanager
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "dashboard_admin"}'
+        GenerateStringKey: password
+        ExcludePunctuation: true
+        PasswordLength: 30
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Isolated subnets for RDS
+      SubnetIds:
+        - !Ref IsolatedSubnet1
+        - !Ref IsolatedSubnet2
+
+  PostgresDb:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub bedrock-dashboard-${Environment}
+      Engine: postgres
+      EngineVersion: '16'
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: 20
+      MaxAllocatedStorage: !If [IsProd, 100, 50]
+      DBName: bedrock_dashboard
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:password}}'
+      VPCSecurityGroups:
+        - !Ref DbSecurityGroup
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      MultiAZ: !If [IsProd, true, false]
+      BackupRetentionPeriod: !If [IsProd, 14, 7]
+      DeletionProtection: !If [IsProd, true, false]
+      StorageEncrypted: true
+      # Enable IAM database authentication alongside the usual password-based
+      # auth. Enabling it does not force IAM auth — it just makes IAM-token
+      # logins available. Operators can later rotate off password auth with
+      # no schema change.
+      EnableIAMDatabaseAuthentication: true
+
+  # ---- ECR ----
+  BackendEcrRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub bedrock-dashboard-backend-${Environment}
+      # Inspect every pushed image for known vulnerabilities. Mirrors
+      # imageScanOnPush: true on the CDK DataStack. Reports surface in
+      # the ECR console per image.
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      # Encrypt the repo at rest with the AWS-managed ECR KMS key.
+      # Operators needing a customer-managed CMK can supply KmsKey here.
+      EncryptionConfiguration:
+        EncryptionType: KMS
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}
+
+  # ---- S3 Access Logs (server-access logs for the other buckets) ----
+  # Dedicated bucket so Bedrock invocation logs (and any other bucket we
+  # add later) can emit server-access logs. Mirrors the CDK
+  # AccessLogsBucket. This IS the server-access-log destination for
+  # other buckets in this stack, so it does not have a
+  # LoggingConfiguration of its own (that would recurse).
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: >-
+              Terminal S3 server-access-log sink. Enabling access logging on
+              this bucket would recurse (a log bucket logging to itself), so it
+              is intentionally the end of the logging chain.
+    Properties:
+      BucketName: !Sub bedrock-dashboard-access-logs-${Environment}-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow S3 server access logging to write (S3 service writes to
+          # this bucket when a source bucket's LoggingConfiguration points
+          # here).
+          - Sid: S3ServerAccessLogsDelivery
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub ${AccessLogsBucket.Arn}/*
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          # Enforce TLS on every request to this bucket
+          # (S3_BUCKET_SSL_REQUESTS_ONLY).
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub ${AccessLogsBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # ---- S3 Invocation Logs ----
+  # Account-wide (not region-scoped — region-scoping was broken, matched
+  # nothing the deploy scripts actually create; see steering). All regions
+  # write into this one bucket under region-prefixed keys.
+  InvocationLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub bedrock-invocation-logs-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Block every public-access vector so no object or ACL can be made
+      # public.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Versioning so a stray delete of a log object is recoverable.
+      VersioningConfiguration:
+        Status: Enabled
+      # Server access logging into AccessLogsBucket.
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: !Sub invocation-logs/${Environment}/
+
+  InvocationLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref InvocationLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Enforce TLS on every request (S3_BUCKET_SSL_REQUESTS_ONLY) —
+          # applied as a Deny, so even allowed Bedrock service writes
+          # must come over HTTPS.
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt InvocationLogsBucket.Arn
+              - !Sub ${InvocationLogsBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: BedrockLogging
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action:
+              - s3:PutObject
+              - s3:GetBucketAcl
+              - s3:GetBucketLocation
+            Resource:
+              - !GetAtt InvocationLogsBucket.Arn
+              - !Sub ${InvocationLogsBucket.Arn}/*
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+Outputs:
+  StackName:
+    Description: This stack's name (consumed by the main stack for cross-stack references)
+    Value: !Ref AWS::StackName
+  VpcId:
+    Value: !Ref VPC
+    Export:
+      Name: !Sub ${AWS::StackName}-VpcId
+  PublicSubnet1Id:
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub ${AWS::StackName}-PublicSubnet1Id
+  PublicSubnet2Id:
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub ${AWS::StackName}-PublicSubnet2Id
+  PrivateSubnet1Id:
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateSubnet1Id
+  PrivateSubnet2Id:
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateSubnet2Id
+  DbEndpoint:
+    Value: !GetAtt PostgresDb.Endpoint.Address
+    Export:
+      Name: !Sub ${AWS::StackName}-DbEndpoint
+  DbPort:
+    Value: !GetAtt PostgresDb.Endpoint.Port
+    Export:
+      Name: !Sub ${AWS::StackName}-DbPort
+  DbSecretArn:
+    Value: !Ref DbSecret
+    Export:
+      Name: !Sub ${AWS::StackName}-DbSecretArn
+  DbSecurityGroupId:
+    Value: !Ref DbSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-DbSecurityGroupId
+  EcrRepositoryUri:
+    Value: !GetAtt BackendEcrRepo.RepositoryUri
+    Export:
+      Name: !Sub ${AWS::StackName}-EcrRepositoryUri
+  InvocationLogsBucketName:
+    Value: !Ref InvocationLogsBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-InvocationLogsBucket
+  # Exported so dependent stacks (Frontend, GuardrailLogsBucket) can point
+  # their S3 LoggingConfiguration + CloudFront access logs here.
+  AccessLogsBucketName:
+    Description: Shared S3 server-access-log destination for this environment
+    Value: !Ref AccessLogsBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-AccessLogsBucket
+  AccessLogsBucketDomainName:
+    Description: Regional domain name of the access logs bucket (for CloudFront logging)
+    Value: !GetAtt AccessLogsBucket.RegionalDomainName
+    Export:
+      Name: !Sub ${AWS::StackName}-AccessLogsBucketDomainName

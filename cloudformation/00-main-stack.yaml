@@ -1,0 +1,172 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bedrock Activity Dashboard - Main (root) Stack.
+  Deploys the entire project as a single nested stack composed of the
+  Data, Backend, and Frontend stacks, in dependency order.
+
+  Packaging (uploads the nested templates to S3 and rewrites TemplateURL):
+    aws cloudformation package \
+      --template-file cloudformation/00-main-stack.yaml \
+      --s3-bucket <YOUR_ARTIFACT_BUCKET> \
+      --output-template-file cloudformation/packaged-main.yaml
+
+  Deploy:
+    aws cloudformation deploy \
+      --template-file cloudformation/packaged-main.yaml \
+      --stack-name BedrockDashboard-dev \
+      --parameter-overrides Environment=dev DbInstanceClass=db.t3.micro \
+        BedrockModelId=us.amazon.nova-pro-v1:0 BedrockRegion=us-west-2 \
+        AppOwner=owner@example.com \
+        AppRepository=https://example.com/your-org/bedrock-activity-dashboard \
+      --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
+
+  NOTE: This provisions infrastructure only. Application artifacts
+  (backend Docker image via CodeBuild, frontend build via `npm run build`
+  + S3 sync) are deployed separately - see cloudformation/README.md.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t3.medium]
+  DesiredCount:
+    Type: Number
+    Default: 1
+    Description: Number of ECS Fargate tasks for the backend service
+  BedrockModelId:
+    Type: String
+    Default: us.amazon.nova-pro-v1:0
+    Description: Bedrock model ID for the AI Agent Chat
+  BedrockRegion:
+    Type: String
+    Default: us-west-2
+  AppOwner:
+    Type: String
+    Default: owner@example.com
+    Description: Contact email for the application owner (AppRegistry metadata attribute)
+  AppRepository:
+    Type: String
+    Default: https://example.com/your-org/bedrock-activity-dashboard
+    Description: URL of the source repository (AppRegistry metadata attribute)
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # AWS Service Catalog AppRegistry - registers the whole dashboard as a single
+  # "Application" so all three nested stacks show up in the unified
+  # myApplications cost/ops view. Additive governance metadata only.
+  # (Parity with infrastructure/lib/app-registry-stack.ts)
+  # ---------------------------------------------------------------------------
+  AppRegistryApplication:
+    Type: AWS::ServiceCatalogAppRegistry::Application
+    Properties:
+      Name: BedrockActivityDashboard
+      Description: >-
+        Bedrock Activity Dashboard - centralized monitoring and governance
+        platform for Amazon Bedrock usage (token consumption, model usage,
+        cost chargeback, and 14 governance AI agents).
+
+  AppRegistryAttributeGroup:
+    Type: AWS::ServiceCatalogAppRegistry::AttributeGroup
+    Properties:
+      Name: bedrock-dashboard-metadata
+      Description: Ownership, environment, and repository metadata for the Bedrock Activity Dashboard.
+      Attributes:
+        applicationName: Bedrock Activity Dashboard
+        owner: !Ref AppOwner
+        environment: !Ref Environment
+        team: Bedrock Governance
+        costCenter: genai-governance
+        repository: !Ref AppRepository
+        appType: GenAI cost governance dashboard
+
+  AppRegistryAttributeGroupAssociation:
+    Type: AWS::ServiceCatalogAppRegistry::AttributeGroupAssociation
+    Properties:
+      Application: !GetAtt AppRegistryApplication.Id
+      AttributeGroup: !GetAtt AppRegistryAttributeGroup.Id
+
+  DataStackAppRegistryAssociation:
+    Type: AWS::ServiceCatalogAppRegistry::ResourceAssociation
+    Properties:
+      Application: !GetAtt AppRegistryApplication.Id
+      Resource: !Ref DataStack
+      ResourceType: CFN_STACK
+
+  BackendStackAppRegistryAssociation:
+    Type: AWS::ServiceCatalogAppRegistry::ResourceAssociation
+    Properties:
+      Application: !GetAtt AppRegistryApplication.Id
+      Resource: !Ref BackendStack
+      ResourceType: CFN_STACK
+
+  FrontendStackAppRegistryAssociation:
+    Type: AWS::ServiceCatalogAppRegistry::ResourceAssociation
+    Properties:
+      Application: !GetAtt AppRegistryApplication.Id
+      Resource: !Ref FrontendStack
+      ResourceType: CFN_STACK
+
+  DataStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./01-data-stack.yaml
+      Parameters:
+        Environment: !Ref Environment
+        DbInstanceClass: !Ref DbInstanceClass
+
+  BackendStack:
+    Type: AWS::CloudFormation::Stack
+    # Dependency on DataStack is enforced by the !GetAtt reference below.
+    Properties:
+      TemplateURL: ./02-backend-stack.yaml
+      Parameters:
+        Environment: !Ref Environment
+        DataStackName: !GetAtt DataStack.Outputs.StackName
+        DesiredCount: !Ref DesiredCount
+        BedrockModelId: !Ref BedrockModelId
+        BedrockRegion: !Ref BedrockRegion
+
+  FrontendStack:
+    Type: AWS::CloudFormation::Stack
+    # Dependency on BackendStack is enforced by the !GetAtt reference below.
+    Properties:
+      TemplateURL: ./03-frontend-stack.yaml
+      Parameters:
+        Environment: !Ref Environment
+        BackendStackName: !GetAtt BackendStack.Outputs.StackName
+
+Outputs:
+  DataStackName:
+    Description: Name of the nested Data stack
+    Value: !GetAtt DataStack.Outputs.StackName
+  BackendStackName:
+    Description: Name of the nested Backend stack
+    Value: !GetAtt BackendStack.Outputs.StackName
+  AlbDnsName:
+    Description: Backend ALB DNS name
+    Value: !GetAtt BackendStack.Outputs.AlbDnsName
+  CodeBuildProjectName:
+    Description: CodeBuild project that builds and pushes the backend image
+    Value: !GetAtt BackendStack.Outputs.CodeBuildProjectName
+  FrontendBucketName:
+    Description: S3 bucket for frontend assets (upload `npm run build` output here)
+    Value: !GetAtt FrontendStack.Outputs.BucketName
+  DistributionId:
+    Description: CloudFront distribution ID (for cache invalidation)
+    Value: !GetAtt FrontendStack.Outputs.DistributionId
+  DashboardUrl:
+    Description: CloudFront URL of the deployed dashboard
+    Value: !GetAtt FrontendStack.Outputs.DistributionUrl
+  InvocationLogsBucketName:
+    Description: S3 bucket receiving Bedrock invocation logs
+    Value: !GetAtt DataStack.Outputs.InvocationLogsBucketName
+  AppRegistryApplicationId:
+    Description: AppRegistry Application ID for the Bedrock Activity Dashboard
+    Value: !GetAtt AppRegistryApplication.Id
+  AppRegistryApplicationArn:
+    Description: AppRegistry Application ARN for the Bedrock Activity Dashboard
+    Value: !GetAtt AppRegistryApplication.Arn

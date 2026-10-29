@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.agentcore.aws.dev/v1/agentcore.json",
+  "name": "weeklydigestorch",
+  "version": 1,
+  "managedBy": "CDK",
+  "tags": {
+    "agentcore:created-by": "agentcore-cli",
+    "agentcore:project-name": "weeklydigestorch"
+  },
+  "runtimes": [
+    {
+      "name": "weeklydigestorch",
+      "build": "CodeZip",
+      "entrypoint": "main.py",
+      "codeLocation": "app/weeklydigestorch/",
+      "runtimeVersion": "PYTHON_3_13",
+      "networkMode": "PUBLIC",
+      "protocol": "HTTP"
+    }
+  ],
+  "memories": [],
+  "credentials": [],
+  "evaluators": [],
+  "onlineEvalConfigs": [],
+  "agentCoreGateways": [],
+  "policyEngines": []
+}

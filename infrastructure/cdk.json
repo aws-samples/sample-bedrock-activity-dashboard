@@ -1,0 +1,19 @@
+{
+  "app": "npx ts-node bin/app.ts",
+  "context": {
+    "environments": {
+      "dev": {
+        "dbInstanceClass": "t3.micro",
+        "desiredCount": 1
+      },
+      "staging": {
+        "dbInstanceClass": "t3.small",
+        "desiredCount": 2
+      },
+      "prod": {
+        "dbInstanceClass": "t3.medium",
+        "desiredCount": 3
+      }
+    }
+  }
+}

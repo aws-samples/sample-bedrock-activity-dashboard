@@ -1,0 +1,9 @@
+{
+  "name": "guardrail-recommender",
+  "description": "Guardrail Recommender Agent - suggests Bedrock Guardrail configs from PII findings",
+  "framework": "strands",
+  "entrypoint": "entrypoint.py",
+  "runtime": {
+    "python_version": "3.13"
+  }
+}

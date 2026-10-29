@@ -1,0 +1,30 @@
+version: 0.2
+# This buildspec is account-agnostic. AWS_ACCOUNT_ID is derived at build time
+# from $CODEBUILD_BUILD_ARN, and region falls back to $AWS_REGION /
+# $AWS_DEFAULT_REGION (both set by CodeBuild).
+#
+# ENV (dev / staging / prod) defaults to "dev" but can be overridden by the
+# CodeBuild project's environmentVariables (set by the deploy scripts).
+#
+# Commands are single-quoted so YAML does not misinterpret shell syntax like
+# `cut -d: -f5` (the ": " would otherwise be parsed as a mapping separator).
+env:
+  variables:
+    ENV: dev
+phases:
+  pre_build:
+    commands:
+      - 'AWS_ACCOUNT_ID=$(echo "$CODEBUILD_BUILD_ARN" | cut -d: -f5)'
+      - 'REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-west-2}}"'
+      - 'ECR_REPO_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/bedrock-dashboard-backend-${ENV}"'
+      - 'echo "Logging in to ECR at $ECR_REPO_URI ..."'
+      - 'aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"'
+  build:
+    commands:
+      - 'echo "Building Docker image..."'
+      - 'docker build --no-cache -t "$ECR_REPO_URI:latest" .'
+  post_build:
+    commands:
+      - 'echo "Pushing to ECR..."'
+      - 'docker push "$ECR_REPO_URI:latest"'
+      - 'echo "Build complete."'

@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "guardrailrecommender"
+version = "0.1.0"
+description = "AgentCore Runtime Agent: guardrail-recommender"
+requires-python = ">=3.10"
+dependencies = [
+    "aws-opentelemetry-distro",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]

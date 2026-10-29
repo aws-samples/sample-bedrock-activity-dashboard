@@ -1,0 +1,12 @@
+[
+  {
+    "name": "default",
+    "account": "__AWS_ACCOUNT_ID__",
+    "region": "us-west-2",
+    "runtime": {
+      "name": "chargeback-reconciliation",
+      "deploymentType": "CODE",
+      "entrypoint": "entrypoint.py"
+    }
+  }
+]

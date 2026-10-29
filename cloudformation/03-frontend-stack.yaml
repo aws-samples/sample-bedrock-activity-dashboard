@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: '2010-09-09'
+#
+# ============================================================================
+# DEPRECATED — DO NOT USE FOR NEW DEPLOYS
+# ============================================================================
+#
+# This CloudFormation template is NOT CURRENT with the API-Gateway +
+# internal-ALB architecture. The CDK stacks under infrastructure/ are the
+# canonical deployment path. This template still points its /api/* origin
+# at the backend ALB over plain HTTP; the CDK frontend stack now points
+# /api/* at API Gateway over HTTPS end-to-end.
+#
+# Use the CDK path:
+#
+#   bash infrastructure/build-and-deploy-backend.sh
+#   bash infrastructure/build-and-deploy-frontend.sh
+#
+# See the root README's "One-time cutover" section for the deploy procedure.
+#
+# This template is retained for diff reference only; it may be removed in
+# a future release.
+# ============================================================================
+Description: >
+  [DEPRECATED — see CDK infrastructure/] Bedrock Activity Dashboard - Frontend Stack
+  S3 static hosting, CloudFront distribution with API proxy. Does NOT
+  include the current API-Gateway-fronted API — use the CDK path.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+  BackendStackName:
+    Type: String
+    Default: BedrockDashboard-Backend-dev
+    Description: Name of the backend stack for ALB DNS
+  DataStackName:
+    Type: String
+    Default: BedrockDashboard-Data-dev
+    Description: >
+      Name of the data stack. Used to import the shared AccessLogsBucket
+      for SiteBucket server-access logging + CloudFront distribution
+      logging.
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Resources:
+  # ---- S3 Bucket ----
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub bedrock-dashboard-${Environment}-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Keep SPA bundle history recoverable.
+      VersioningConfiguration:
+        Status: Enabled
+      # Server-access logs into the Data stack's shared AccessLogsBucket.
+      LoggingConfiguration:
+        DestinationBucketName:
+          Fn::ImportValue: !Sub ${DataStackName}-AccessLogsBucket
+        LogFilePrefix: !Sub site-bucket/${Environment}/
+
+  # ---- CloudFront OAI ----
+  CloudFrontOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub OAI for bedrock-dashboard ${Environment}
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudFrontReadAccess
+            Effect: Allow
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOAI.S3CanonicalUserId
+            Action: s3:GetObject
+            Resource: !Sub ${SiteBucket.Arn}/*
+          # Enforce TLS on every request to the bucket
+          # (S3_BUCKET_SSL_REQUESTS_ONLY). CloudFront already uses HTTPS to
+          # fetch via OAI, so this is defense-in-depth against direct
+          # (non-OAI) access attempts.
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt SiteBucket.Arn
+              - !Sub ${SiteBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # ---- CloudFront Distribution ----
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          # S3 origin for static assets
+          - Id: S3Origin
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub origin-access-identity/cloudfront/${CloudFrontOAI}
+          # ALB origin for API proxy
+          - Id: APIOrigin
+            DomainName:
+              Fn::ImportValue: !Sub ${BackendStackName}-AlbDnsName
+            CustomOriginConfig:
+              HTTPPort: 80
+              OriginProtocolPolicy: http-only
+        # Distribution-level access logging into the shared AccessLogsBucket.
+        # Standard CloudFront logging — written as hourly gzipped files
+        # under cloudfront-logs/<env>/.
+        Logging:
+          Bucket:
+            Fn::ImportValue: !Sub ${DataStackName}-AccessLogsBucketDomainName
+          Prefix: !Sub cloudfront-logs/${Environment}/
+          IncludeCookies: false
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+          Compress: true
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: APIOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingDisabled
+            OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3  # AllViewer
+            Compress: false
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 300
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+Outputs:
+  DistributionUrl:
+    Value: !Sub https://${Distribution.DomainName}
+    Description: CloudFront distribution URL
+  DistributionId:
+    Value: !Ref Distribution
+    Description: CloudFront distribution ID (for cache invalidation)
+  BucketName:
+    Value: !Ref SiteBucket
+    Description: S3 bucket for frontend assets

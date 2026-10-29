@@ -1,0 +1,772 @@
+AWSTemplateFormatVersion: '2010-09-09'
+#
+# ============================================================================
+# DEPRECATED — DO NOT USE FOR NEW DEPLOYS
+# ============================================================================
+#
+# This CloudFormation template is NOT CURRENT with the API-Gateway +
+# internal-ALB architecture. The CDK stacks under infrastructure/ are the
+# canonical deployment path and include:
+#
+#   - Internal ALB (private subnets, no public IP)
+#   - API Gateway REST API in front of the ALB, with:
+#       - VPC Link v2 private integration to the internal ALB
+#       - Cognito user-pool authorizer on /{proxy+}
+#       - /api/health/config left unauthenticated for the SPA login page
+#       - Stage throttling + access logging + response streaming (SSE)
+#   - CloudFront /api/* origin pointing at API Gateway over HTTPS
+#
+# This template still reflects the legacy architecture (publicly-exposed
+# ALB on HTTP:80) and will NOT match the current security posture if
+# deployed as-is. Use the CDK path:
+#
+#   bash infrastructure/build-and-deploy-backend.sh
+#   bash infrastructure/build-and-deploy-frontend.sh
+#
+# See the root README's "One-time cutover" section for the deploy procedure.
+#
+# This template is retained for diff reference only; it may be removed in
+# a future release.
+# ============================================================================
+Description: >
+  [DEPRECATED — see CDK infrastructure/] Bedrock Activity Dashboard - Backend Stack
+  ECS Fargate, ALB, CodeBuild, IAM roles. Does NOT include the current
+  API-Gateway-in-front-of-internal-ALB architecture — use the CDK path.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+  DataStackName:
+    Type: String
+    Default: BedrockDashboard-Data-dev
+    Description: Name of the data stack for cross-stack references
+  DesiredCount:
+    Type: Number
+    Default: 1
+  BedrockModelId:
+    Type: String
+    Default: us.amazon.nova-pro-v1:0
+    Description: Bedrock model ID for the AI Agent Chat
+  BedrockRegion:
+    Type: String
+    Default: us-west-2
+  AdditionalCloudtrailRegions:
+    Type: String
+    Default: us-east-1
+    Description: >
+      Comma-separated list of ADDITIONAL regions (beyond BedrockRegion, which
+      is always included) for CloudTrailService to fan Bedrock activity
+      ingestion out across (F1 — multi-region ingestion + region filter).
+      Each region must have Bedrock model invocation logging enabled
+      separately (see infrastructure/enable-bedrock-logging-all-regions.sh)
+      or its ingestion simply returns no records, not an error. Set to an
+      empty string to opt back into single-region-only ingestion.
+  # ---- CUR 2.0 / Athena billed-cost ingestion (all optional) ----
+  # Empty defaults so an environment without a configured CUR export still
+  # deploys and the backend degrades gracefully to estimated-only cost figures.
+  AthenaDatabase:
+    Type: String
+    Default: ''
+    Description: Glue database overlaying the CUR 2.0 export (empty = CUR disabled)
+  AthenaTable:
+    Type: String
+    Default: ''
+    Description: CUR table name in the Glue database (empty = CUR disabled)
+  AthenaWorkgroup:
+    Type: String
+    Default: primary
+    Description: Athena workgroup used to run the CUR aggregation query
+  AthenaOutputS3:
+    Type: String
+    Default: ''
+    Description: Athena query-results location, s3://bucket/prefix (empty = CUR disabled)
+  AthenaResultsBucket:
+    Type: String
+    Default: ''
+    Description: Bucket holding Athena query results (task reads/writes here)
+  AthenaResultsPrefix:
+    Type: String
+    Default: ''
+    Description: Key prefix within the Athena results bucket
+  CurExportBucket:
+    Type: String
+    Default: ''
+    Description: Bucket holding the CUR 2.0 Parquet export (Athena reads in place)
+  CurExportPrefix:
+    Type: String
+    Default: ''
+    Description: Key prefix of the CUR export within the export bucket
+  CurStalenessHours:
+    Type: String
+    Default: '48'
+    AllowedPattern: '^[0-9]+$'
+    Description: Age (hours) after which billed cost is flagged stale
+  CurIngestEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Kill switch for CUR ingestion
+  # ---- AgentCore Runtime consumption cost tracking (live CloudWatch) ----
+  AgentCoreCostTrackingEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Kill switch for AgentCore Runtime cost tracking
+  AgentCoreVcpuHourlyRate:
+    Type: String
+    Default: '0.0895'
+    Description: $/vCPU-hour rate for AgentCore Runtime cost (published on-demand price)
+  AgentCoreMemoryGbHourlyRate:
+    Type: String
+    Default: '0.00945'
+    Description: $/GB-hour rate for AgentCore Runtime cost (published on-demand price)
+  # ---- AgentCore Runtime discovery (account-wide, read-only visibility scan) ----
+  AgentCoreDiscoveryEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Kill switch for AgentCore Runtime discovery
+  AgentCoreDiscoveryRegions:
+    Type: String
+    Default: 'us-west-2,us-east-1'
+    Description: Comma-separated list of regions to scan for AgentCore Runtimes
+
+Conditions:
+  # Scope the Athena/Glue/S3 CUR permissions tightly only when a CUR database is
+  # configured. Absent config => no CUR policy is attached (graceful degradation).
+  HasAthenaConfig: !Not [!Equals [!Ref AthenaDatabase, '']]
+  # F1 — multi-region ingestion: only append AdditionalCloudtrailRegions to
+  # CLOUDTRAIL_REGIONS when it's non-empty (opt-out support).
+  HasAdditionalCloudtrailRegions: !Not [!Equals [!Ref AdditionalCloudtrailRegions, '']]
+
+Resources:
+  # ---- ECS Cluster ----
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub bedrock-dashboard-${Environment}
+
+  # ---- IAM Roles ----
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - Fn::ImportValue: !Sub ${DataStackName}-DbSecretArn
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub bedrock-dashboard-task-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        # Bedrock model invocations — Agent Chat, demo generation, V2 agent
+        # fallback. Scoped to foundation models + inference profiles across
+        # all regions (cross-region inference profiles may transparently
+        # execute in a different region than the caller's).
+        - PolicyName: BedrockModelInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:Converse
+                  - bedrock:ConverseStream
+                  - bedrock:InvokeInlineAgent
+                Resource:
+                  - arn:aws:bedrock:*::foundation-model/*
+                  - arn:aws:bedrock:*:*:inference-profile/*
+                  - arn:aws:bedrock:*:*:application-inference-profile/*
+        # Guardrail management + read + apply. Previously granted on
+        # Resource '*', which let the task role modify or delete any
+        # guardrail in the account. Scoped to guardrail ARNs only.
+        - PolicyName: BedrockGuardrailManage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:CreateGuardrail
+                  - bedrock:CreateGuardrailVersion
+                  - bedrock:UpdateGuardrail
+                  - bedrock:GetGuardrail
+                  - bedrock:DeleteGuardrail
+                  - bedrock:ApplyGuardrail
+                Resource: arn:aws:bedrock:*:*:guardrail/*
+        # bedrock:ListGuardrails is a list API with no scopeable resource.
+        - PolicyName: BedrockGuardrailList
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock:ListGuardrails
+                Resource: '*'
+        # AgentCore Runtime invocation — scoped to runtimes in THIS account
+        # across all regions.
+        - PolicyName: AgentCoreRuntimeInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource: !Sub arn:aws:bedrock-agentcore:*:${AWS::AccountId}:runtime/*
+        - PolicyName: CloudTrailAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: cloudtrail:LookupEvents
+                Resource: '*'
+        # Profile-tag resolution for inference-profile attribution (Req 4.2).
+        # Available regardless of CUR config so live tag lookups still work.
+        - PolicyName: ProfileTagAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock:ListTagsForResource
+                Resource: arn:aws:bedrock:*:*:application-inference-profile/*
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:FilterLogEvents
+                  - logs:GetLogEvents
+                  - logs:DescribeLogGroups
+                Resource: '*'
+        - PolicyName: S3LogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                # Bedrock invocation logging writes into ONE shared,
+                # account-wide bucket for every region (bedrock-invocation-
+                # logs-<account>, NOT one bucket per region — region is
+                # distinguished only by S3 key prefix, see
+                # infrastructure/enable-bedrock-logging-all-regions.sh and
+                # CloudTrailService._s3_prefix_for). The previous
+                # per-region bucket name pattern here
+                # (bedrock-invocation-logs-${AWS::Region}-${AWS::AccountId})
+                # never matched what any deploy script or the backend code
+                # actually provisions/reads — corrected to the real
+                # single-bucket naming convention so this grant is usable
+                # for multi-region ingestion (F1) as well as single-region.
+                Resource:
+                  - !Sub arn:aws:s3:::bedrock-invocation-logs-${AWS::AccountId}
+                  - !Sub arn:aws:s3:::bedrock-invocation-logs-${AWS::AccountId}/*
+        # Alarm fan-out via SNS. The CDK stack creates the actual
+        # bedrock-dashboard-alerts-<env> topic; this CFN template follows
+        # the same naming convention so the IAM grant is already in place
+        # for operators who stand up the topic separately.
+        - PolicyName: SNSAlertTopicPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:bedrock-dashboard-alerts-${Environment}
+        # AgentCore Runtime consumption cost (live CloudWatch metrics, no
+        # Athena/CUR dependency). GetMetricData does not support
+        # resource-level permissions, so Resource must be '*'; read-only.
+        - PolicyName: AgentCoreCostAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: cloudwatch:GetMetricData
+                Resource: '*'
+        # AgentCore Runtime discovery: account-wide, read-only visibility scan
+        # (AgentCoreDiscoveryService). ListAgentRuntimes/GetAgentRuntime do not
+        # support resource-level permissions, so Resource must be '*'. This is
+        # intentionally broader than AgentCoreCostAccess above — it can see ANY
+        # AgentCore Runtime in a scanned region, not just the 14 governed
+        # agents. Read-only; never creates, updates, or invokes.
+        - PolicyName: AgentCoreDiscoveryAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:ListAgentRuntimes
+                  - bedrock-agentcore:GetAgentRuntime
+                Resource: '*'
+        - PolicyName: SecretsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - Fn::ImportValue: !Sub ${DataStackName}-DbSecretArn
+
+  # ---- CUR 2.0 / Athena least-privilege policy (attached only when configured) ----
+  # Scoped to the workgroup / Glue database+table / CUR export prefix / results
+  # prefix built from the Athena parameters. Attached to the backend task role
+  # only when AthenaDatabase is provided, so a CUR-less environment carries no
+  # extra permissions.
+  TaskRoleCurAthenaPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasAthenaConfig
+    Properties:
+      PolicyName: CurAthenaAccess
+      Roles:
+        - !Ref TaskRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Athena query lifecycle, scoped to the workgroup
+          - Effect: Allow
+            Action:
+              - athena:StartQueryExecution
+              - athena:GetQueryExecution
+              - athena:GetQueryResults
+              - athena:StopQueryExecution
+            Resource: !Sub arn:aws:athena:*:*:workgroup/${AthenaWorkgroup}
+          # Glue catalog metadata for the CUR database/table
+          - Effect: Allow
+            Action:
+              - glue:GetTable
+              - glue:GetDatabase
+              - glue:GetPartitions
+            Resource:
+              - arn:aws:glue:*:*:catalog
+              - !Sub arn:aws:glue:*:*:database/${AthenaDatabase}
+              - !Sub arn:aws:glue:*:*:table/${AthenaDatabase}/${AthenaTable}
+          # CUR export prefix — Athena reads the Parquet in place
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Sub arn:aws:s3:::${CurExportBucket}
+              - !Sub arn:aws:s3:::${CurExportBucket}/${CurExportPrefix}*
+          # Athena query-results bucket/prefix — Athena writes, the task reads
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+              - !Sub arn:aws:s3:::${AthenaResultsBucket}
+              - !Sub arn:aws:s3:::${AthenaResultsBucket}/${AthenaResultsPrefix}*
+
+  # ---- ALB ----
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB security group
+      VpcId:
+        Fn::ImportValue: !Sub ${DataStackName}-VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub bedrock-dashboard-${Environment}
+      Scheme: internet-facing
+      Subnets:
+        - Fn::ImportValue: !Sub ${DataStackName}-PublicSubnet1Id
+        - Fn::ImportValue: !Sub ${DataStackName}-PublicSubnet2Id
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 8000
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub ${DataStackName}-VpcId
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ---- ECS Task Definition ----
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/bedrock-dashboard-backend-${Environment}
+      RetentionInDays: 30
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub bedrock-dashboard-backend-${Environment}
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: web
+          Image: !Sub
+            - ${RepoUri}:latest
+            - RepoUri:
+                Fn::ImportValue: !Sub ${DataStackName}-EcrRepositoryUri
+          PortMappings:
+            - ContainerPort: 8000
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: DATABASE_HOST
+              Value:
+                Fn::ImportValue: !Sub ${DataStackName}-DbEndpoint
+            - Name: DATABASE_PORT
+              Value:
+                Fn::ImportValue: !Sub ${DataStackName}-DbPort
+            - Name: DATABASE_NAME
+              Value: bedrock_dashboard
+            - Name: BEDROCK_MODEL_ID
+              Value: !Ref BedrockModelId
+            - Name: BEDROCK_REGION
+              Value: !Ref BedrockRegion
+            - Name: CORS_ORIGINS
+              Value: '*'
+            - Name: APP_NAME
+              Value: Bedrock Activity Dashboard
+            - Name: CLOUDTRAIL_REGIONS
+              # BedrockRegion is always included; AdditionalCloudtrailRegions
+              # (F1) is appended when non-empty. No de-dup here (unlike the
+              # CDK stack) — if an operator sets AdditionalCloudtrailRegions
+              # to the same value as BedrockRegion, CloudTrailService's
+              # parse_regions()/configured_regions() would fan out to that
+              # region twice; harmless (redundant fetch, same result merged
+              # by the id-based dedup) but wasteful, so avoid that overlap
+              # when setting this parameter.
+              Value: !If
+                - HasAdditionalCloudtrailRegions
+                - !Sub '${BedrockRegion},${AdditionalCloudtrailRegions}'
+                - !Ref BedrockRegion
+            # ---- CUR 2.0 / Athena billed-cost ingestion (optional) ----
+            - Name: ATHENA_DATABASE
+              Value: !Ref AthenaDatabase
+            - Name: ATHENA_TABLE
+              Value: !Ref AthenaTable
+            - Name: ATHENA_WORKGROUP
+              Value: !Ref AthenaWorkgroup
+            - Name: ATHENA_OUTPUT_S3
+              Value: !Ref AthenaOutputS3
+            - Name: ATHENA_REGION
+              Value: !Ref AWS::Region
+            - Name: CUR_STALENESS_HOURS
+              Value: !Ref CurStalenessHours
+            - Name: CUR_INGEST_ENABLED
+              Value: !Ref CurIngestEnabled
+            # ---- AgentCore Runtime consumption cost tracking (optional) ----
+            - Name: AGENTCORE_COST_TRACKING_ENABLED
+              Value: !Ref AgentCoreCostTrackingEnabled
+            - Name: AGENTCORE_VCPU_HOURLY_RATE
+              Value: !Ref AgentCoreVcpuHourlyRate
+            - Name: AGENTCORE_MEMORY_GB_HOURLY_RATE
+              Value: !Ref AgentCoreMemoryGbHourlyRate
+            # ---- AgentCore Runtime discovery (account-wide, read-only) ----
+            - Name: AGENTCORE_DISCOVERY_ENABLED
+              Value: !Ref AgentCoreDiscoveryEnabled
+            - Name: AGENTCORE_DISCOVERY_REGIONS
+              Value: !Ref AgentCoreDiscoveryRegions
+          Secrets:
+            - Name: DB_SECRET_ARN
+              ValueFrom:
+                Fn::ImportValue: !Sub ${DataStackName}-DbSecretArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: web
+
+  # ---- ECS Service ----
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS service security group
+      VpcId:
+        Fn::ImportValue: !Sub ${DataStackName}-VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: !Sub bedrock-dashboard-backend-${Environment}
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - Fn::ImportValue: !Sub ${DataStackName}-PrivateSubnet1Id
+            - Fn::ImportValue: !Sub ${DataStackName}-PrivateSubnet2Id
+          SecurityGroups:
+            - !Ref ServiceSecurityGroup
+      LoadBalancers:
+        - ContainerName: web
+          ContainerPort: 8000
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ---- Daily CUR billed-cost ingestion (EventBridge Scheduler -> ECS RunTask) ----
+  # Runs daily at 09:00 UTC, after the 08:00 UTC Glue crawler has refreshed the
+  # CUR table partitions. Reuses the backend task definition with a container
+  # command override to the module entrypoint, which exits 0 on success/skip
+  # (Athena unconfigured => graceful no-op) and 1 on failure so failed runs are
+  # observable in ECS task history. Not gated on the Athena parameters — the
+  # entrypoint no-ops safely when unconfigured.
+  CurIngestionSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CurIngestionRunTask
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource:
+                  - !Ref TaskDefinition
+                  - !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/bedrock-dashboard-backend-${Environment}:*
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt TaskRole.Arn
+                  - !GetAtt TaskExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+  CurIngestionSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub bedrock-dashboard-cur-ingestion-${Environment}
+      Description: Daily CUR 2.0 billed-cost ingestion (python -m app.services.cur_ingestion_service)
+      ScheduleExpression: cron(0 9 * * ? *)
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      State: ENABLED
+      Target:
+        Arn: !GetAtt EcsCluster.Arn
+        RoleArn: !GetAtt CurIngestionSchedulerRole.Arn
+        EcsParameters:
+          TaskDefinitionArn: !Ref TaskDefinition
+          LaunchType: FARGATE
+          TaskCount: 1
+          NetworkConfiguration:
+            AwsvpcConfiguration:
+              # Same networking as the ECS service above.
+              AssignPublicIp: ENABLED
+              Subnets:
+                - Fn::ImportValue: !Sub ${DataStackName}-PrivateSubnet1Id
+                - Fn::ImportValue: !Sub ${DataStackName}-PrivateSubnet2Id
+              SecurityGroups:
+                - !Ref ServiceSecurityGroup
+        Input: '{"containerOverrides":[{"name":"web","command":["python","-m","app.services.cur_ingestion_service"]}]}'
+
+  # ---- Daily AgentCore Runtime discovery (EventBridge Scheduler -> ECS RunTask) ----
+  # Runs daily at 10:00 UTC (after the CUR ingestion schedule at 09:00). Same
+  # reuse pattern as CurIngestionSchedule above: the backend task definition,
+  # command override to the discovery module entrypoint. Exits 0 on
+  # success/partial_failure/skipped, 1 only when every configured region
+  # failed.
+  AgentCoreDiscoverySchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AgentCoreDiscoveryRunTask
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource:
+                  - !Ref TaskDefinition
+                  - !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/bedrock-dashboard-backend-${Environment}:*
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt TaskRole.Arn
+                  - !GetAtt TaskExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+  AgentCoreDiscoverySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub bedrock-dashboard-agentcore-discovery-${Environment}
+      Description: Daily AgentCore Runtime discovery scan (python -m app.services.agentcore_discovery_service)
+      ScheduleExpression: cron(0 10 * * ? *)
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      State: ENABLED
+      Target:
+        Arn: !GetAtt EcsCluster.Arn
+        RoleArn: !GetAtt AgentCoreDiscoverySchedulerRole.Arn
+        EcsParameters:
+          TaskDefinitionArn: !Ref TaskDefinition
+          LaunchType: FARGATE
+          TaskCount: 1
+          NetworkConfiguration:
+            AwsvpcConfiguration:
+              AssignPublicIp: ENABLED
+              Subnets:
+                - Fn::ImportValue: !Sub ${DataStackName}-PrivateSubnet1Id
+                - Fn::ImportValue: !Sub ${DataStackName}-PrivateSubnet2Id
+              SecurityGroups:
+                - !Ref ServiceSecurityGroup
+        Input: '{"containerOverrides":[{"name":"web","command":["python","-m","app.services.agentcore_discovery_service"]}]}'
+
+  # ---- CodeBuild ----
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # ecr:GetAuthorizationToken is the one ECR action that requires Resource "*".
+              - Sid: EcrAuthToken
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              # All push + layer actions are pinned to the backend's ECR repo
+              # ARN only, so a compromised CodeBuild build cannot overwrite
+              # images in any other ECR repo in the account. ARN is derived
+              # from the Data stack's deterministic repo name pattern
+              # (bedrock-dashboard-backend-<env>) instead of relying on an
+              # ImportValue, which would introduce a new cross-stack export.
+              - Sid: EcrPushToBackendRepo
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/bedrock-dashboard-backend-${Environment}
+              # Scoped to this CodeBuild project's log group only.
+              - Sid: CloudWatchLogsForBuild
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/bedrock-dashboard-backend-build-${Environment}
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/bedrock-dashboard-backend-build-${Environment}:*
+              - Sid: S3ReadBuildSource
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub arn:aws:s3:::bedrock-dashboard-build-${Environment}-${AWS::AccountId}/*
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub bedrock-dashboard-backend-build-${Environment}
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REPO_URI
+            Value:
+              Fn::ImportValue: !Sub ${DataStackName}-EcrRepositoryUri
+      Source:
+        Type: S3
+        Location: !Sub bedrock-dashboard-build-${Environment}-${AWS::AccountId}/backend-source.zip
+      Artifacts:
+        Type: NO_ARTIFACTS
+
+Outputs:
+  StackName:
+    Description: This stack's name (consumed by the main stack for cross-stack references)
+    Value: !Ref AWS::StackName
+  AlbDnsName:
+    Value: !GetAtt ALB.DNSName
+    Export:
+      Name: !Sub ${AWS::StackName}-AlbDnsName
+  ServiceArn:
+    Value: !Ref EcsService
+  CodeBuildProjectName:
+    Value: !Ref CodeBuildProject
+  ClusterName:
+    Value: !Ref EcsCluster

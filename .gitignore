@@ -1,0 +1,100 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+# Root-anchored so CDK sources under infrastructure/lib are tracked
+/lib/
+/lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+.tmp/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Environment variables
+.env
+.env.local
+
+# AWS
+.aws/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Hypothesis test database
+.hypothesis/
+
+# CDK outputs (generated, not needed in repo)
+infrastructure/cdk.out/
+infrastructure/cdk-out-*/
+# CDK's context cache pins per-account lookups (AZs, hosted zones, etc.) that
+# would otherwise leak the source account into the repo. Keep it local.
+infrastructure/cdk.context.json
+
+# AgentCore CLI artifacts
+agentcore-agents/**/agentcore/.cli/
+agentcore-agents/**/agentcore/.cache/
+agentcore-agents/**/agentcore/cdk/cdk.out/
+agentcore-agents/**/agentcore/cdk/node_modules/
+agentcore-agents/**/agentcore/cdk/dist/
+agentcore-agents/**/.venv/
+agentcore-agents/**/uv.lock
+
+# Generated diagrams (regenerated from code)
+generated-diagrams/
+
+# Sample/test files
+sample-cost-explorer-*.csv
+
+# Kiro IDE metadata — internal design docs, agent configs, memory.
+# Not part of the public sample; excluded from the aws-samples repo.
+.kiro/
+infrastructure/.env.deploy
+
+# Local-only docs/scripts — not meant for the shared repo
+/PITCH.md
+/scripts/create-guest-user.sh
+
+# TypeScript incremental build cache — regenerated on every build. Keeping
+# this out of git stops noisy conflicts when two branches rebuild it.
+frontend/tsconfig.tsbuildinfo
+
+# Local scanner working directory - keep out of a public repo.
+.holmes/

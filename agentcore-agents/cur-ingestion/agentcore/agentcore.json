@@ -1,0 +1,9 @@
+{
+  "name": "cur-ingestion",
+  "description": "CUR Ingestion Agent - deterministic CUR 2.0 billed-cost ingestion via Athena (direct execution path)",
+  "framework": "strands",
+  "entrypoint": "main_lightweight.py",
+  "runtime": {
+    "python_version": "3.13"
+  }
+}

@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Bedrock Guardrail with S3 Logging Infrastructure'
+
+Parameters:
+  GuardrailName:
+    Type: String
+    Default: 'content-filter-guardrail'
+    Description: 'Name for the Bedrock guardrail'
+
+  S3BucketName:
+    Type: String
+    Default: 'bedrock-guardrail-logs'
+    Description: 'S3 bucket name for guardrail logs (will be made unique)'
+
+  AccessLogsBucketName:
+    Type: String
+    Default: ''
+    Description: >
+      Optional existing S3 bucket name to receive server-access logs for
+      GuardrailLogsBucket. When supplied, GuardrailLogsBucket forwards
+      access logs there under guardrail-logs/<GuardrailName>/.
+      Leaving this empty keeps the standalone sample deployable without a
+      prerequisite access-logs bucket.
+
+Conditions:
+  HasAccessLogsBucket: !Not [!Equals [!Ref AccessLogsBucketName, '']]
+
+Resources:
+  # S3 Bucket for logging guardrail invocations. This is a standalone
+  # sample stack: the server-access-logs destination is parameterized
+  # (opt-in via AccessLogsBucketName) so the template deploys without a
+  # prerequisite log bucket. When AccessLogsBucketName is set,
+  # LoggingConfiguration is attached below.
+  GuardrailLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${S3BucketName}-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LoggingConfiguration: !If
+        - HasAccessLogsBucket
+        - DestinationBucketName: !Ref AccessLogsBucketName
+          LogFilePrefix: !Sub 'guardrail-logs/${GuardrailName}/'
+        - !Ref AWS::NoValue
+
+  # TLS-only policy on GuardrailLogsBucket (defense-in-depth; the Lambda
+  # already uses the AWS SDK which is HTTPS, this blocks any direct access).
+  GuardrailLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref GuardrailLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt GuardrailLogsBucket.Arn
+              - !Sub '${GuardrailLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # IAM Role for Lambda function
+  GuardrailLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GuardrailLoggerS3Write
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Scoped to just the log bucket's objects. The Lambda is a log
+              # writer; it does not invoke Bedrock, so the previous
+              # bedrock:InvokeModel / InvokeModelWithResponseStream /
+              # ApplyGuardrail grants were unused and have been removed.
+              # s3:PutObjectAcl is also removed since put_object() alone is
+              # all the handler calls.
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub '${GuardrailLogsBucket}/*'
+
+  # Lambda function for guardrail logging
+  GuardrailLoggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${GuardrailName}-logger'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt GuardrailLambdaRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref GuardrailLogsBucket
+      Code:
+        ZipFile: |
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          import boto3
+
+          s3 = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              bucket = os.environ['S3_BUCKET']
+              now = datetime.now(timezone.utc)
+              timestamp = now.isoformat()
+
+              log_entry = {
+                  'timestamp': timestamp,
+                  'guardrail_invocation': event,
+                  'context': str(context)
+              }
+
+              key = f"guardrail-logs/{now.strftime('%Y/%m/%d')}/{timestamp}.json"
+              
+              try:
+                  s3.put_object(
+                      Bucket=bucket,
+                      Key=key,
+                      Body=json.dumps(log_entry, indent=2),
+                      ContentType='application/json'
+                  )
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Log entry created successfully')
+                  }
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error creating log entry: {str(e)}')
+                  }
+
+Outputs:
+  S3BucketName:
+    Description: 'S3 bucket for guardrail logs'
+    Value: !Ref GuardrailLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3Bucket'
+  
+  LambdaFunctionArn:
+    Description: 'Lambda function ARN for logging'
+    Value: !GetAtt GuardrailLoggerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaArn'

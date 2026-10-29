@@ -1,0 +1,9 @@
+{
+  "name": "weekly-digest-orchestrator",
+  "description": "Weekly Digest Orchestrator Agent - compiles findings from all agents into a weekly digest and sends via SNS",
+  "framework": "strands",
+  "entrypoint": "entrypoint.py",
+  "runtime": {
+    "python_version": "3.13"
+  }
+}
